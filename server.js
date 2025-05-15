@@ -52,6 +52,16 @@ const FAL_SUPPORTED_MODELS = [
     "meta-llama/llama-4-scout"
 ];
 
+// 新增：支持多模态的模型列表
+const MULTIMODAL_MODELS = [
+    "anthropic/claude-3.7-sonnet",
+    "anthropic/claude-3.5-sonnet",
+    "anthropic/claude-3-haiku",
+    "google/gemini-pro-1.5",
+    "openai/gpt-4o-mini",
+    "openai/gpt-4o"
+];
+
 // === 修改：鉴权中间件使用Bearer认证 ===
 const authenticateRequest = (req, res, next) => {
     // 从Authorization头部中获取Bearer token
@@ -103,14 +113,170 @@ app.get('/v1/models', (req, res) => {
     }
 });
 
+// === 新增：检测模型是否支持多模态 ===
+function supportsMultimodal(modelId) {
+    return MULTIMODAL_MODELS.includes(modelId);
+}
 
-// === 修改后的 convertMessagesToFalPrompt 函数 (System置顶 + 分隔符 + 对话历史Recency) ===
-function convertMessagesToFalPrompt(messages) {
+// === 新增：处理图像转换为fal格式的函数 ===
+function processImageForFal(imageUrl, imageBase64) {
+    // fal-ai图像格式接受url或base64
+    if (imageUrl) {
+        return { url: imageUrl };
+    } else if (imageBase64) {
+        // 确保base64前缀符合要求
+        let finalBase64 = imageBase64;
+        if (finalBase64.startsWith('data:')) {
+            // 从data URI中提取实际的base64部分
+            const dataUriParts = finalBase64.split(',');
+            if (dataUriParts.length > 1) {
+                finalBase64 = dataUriParts[1];
+            }
+        }
+        return { base64: finalBase64 };
+    }
+    return null;
+}
+
+// === 修改：支持多模态消息的转换函数 ===
+function convertMessagesToFalPrompt(messages, modelId) {
     let fixed_system_prompt_content = "";
     const conversation_message_blocks = [];
-    console.log(`Original messages count: ${messages.length}`);
+    const isMultiModal = supportsMultimodal(modelId);
+    
+    console.log(`Original messages count: ${messages.length}, Model supports multimodal: ${isMultiModal}`);
 
-    // 1. 分离 System 消息，格式化 User/Assistant 消息
+    // 特殊处理多模态输入
+    if (isMultiModal && modelId.startsWith("anthropic/claude")) {
+        // 为Claude模型构建多模态输入
+        const anthropicMessages = [];
+        let hasSystemMessage = false;
+
+        for (const message of messages) {
+            if (message.role === 'system') {
+                // Claude使用单独的system参数
+                fixed_system_prompt_content += String(message.content || "");
+                hasSystemMessage = true;
+                continue;
+            }
+            
+            // 处理user或assistant消息
+            let anthropicMessage = {
+                role: message.role === 'assistant' ? 'assistant' : 'user',
+                content: []
+            };
+            
+            // 处理消息内容（可能是字符串或内容数组）
+            if (Array.isArray(message.content)) {
+                // 处理消息内容数组（包含文本和图像）
+                for (const part of message.content) {
+                    if (part.type === 'text') {
+                        anthropicMessage.content.push({
+                            type: 'text',
+                            text: part.text || ""
+                        });
+                    } else if (part.type === 'image_url') {
+                        // 处理图像URL部分
+                        let imageData = null;
+                        if (typeof part.image_url === 'string') {
+                            imageData = processImageForFal(part.image_url, null);
+                        } else if (part.image_url && part.image_url.url) {
+                            imageData = processImageForFal(part.image_url.url, null);
+                        } else if (part.image_url && part.image_url.base64) {
+                            imageData = processImageForFal(null, part.image_url.base64);
+                        }
+                        
+                        if (imageData) {
+                            anthropicMessage.content.push({
+                                type: 'image',
+                                source: imageData
+                            });
+                        }
+                    }
+                }
+            } else if (typeof message.content === 'string' || message.content === null) {
+                // 简单字符串内容
+                anthropicMessage.content.push({
+                    type: 'text',
+                    text: String(message.content || "")
+                });
+            }
+            
+            anthropicMessages.push(anthropicMessage);
+        }
+        
+        // 构建适合fal的格式
+        // 根据fal-ai对Claude的要求，返回适合的结构
+        return {
+            system_prompt: fixed_system_prompt_content.trim(),
+            anthropic_messages: anthropicMessages,
+            // 标记这是Claude多模态格式
+            is_claude_multimodal: true
+        };
+    } else if (isMultiModal) {
+        // 其他多模态模型的处理（如Gemini、GPT-4）
+        // 这里简化处理，实际项目可能需要针对每个模型定制
+        console.log("Using generic multimodal format for non-Claude model");
+        
+        // 为其他模型构建多模态输入（简化格式，可能需要针对不同模型调整）
+        const multimodalMessages = [];
+        
+        for (const message of messages) {
+            if (message.role === 'system') {
+                fixed_system_prompt_content += String(message.content || "");
+                continue;
+            }
+            
+            // 创建通用多模态消息格式
+            let genericMessage = {
+                role: message.role,
+                content: []
+            };
+            
+            if (Array.isArray(message.content)) {
+                for (const part of message.content) {
+                    if (part.type === 'text') {
+                        genericMessage.content.push({
+                            type: 'text',
+                            text: part.text || ""
+                        });
+                    } else if (part.type === 'image_url') {
+                        // 处理图像
+                        let imageData = null;
+                        if (typeof part.image_url === 'string') {
+                            imageData = processImageForFal(part.image_url, null);
+                        } else if (part.image_url && part.image_url.url) {
+                            imageData = processImageForFal(part.image_url.url, null);
+                        } else if (part.image_url && part.image_url.base64) {
+                            imageData = processImageForFal(null, part.image_url.base64);
+                        }
+                        
+                        if (imageData) {
+                            genericMessage.content.push({
+                                type: 'image',
+                                source: imageData
+                            });
+                        }
+                    }
+                }
+            } else if (typeof message.content === 'string' || message.content === null) {
+                genericMessage.content.push({
+                    type: 'text',
+                    text: String(message.content || "")
+                });
+            }
+            
+            multimodalMessages.push(genericMessage);
+        }
+        
+        return {
+            system_prompt: fixed_system_prompt_content.trim(),
+            generic_multimodal_messages: multimodalMessages,
+            is_generic_multimodal: true
+        };
+    }
+
+    // 1. 分离 System 消息，格式化 User/Assistant 消息（原始文本处理逻辑不变）
     for (const message of messages) {
         let content = (message.content === null || message.content === undefined) ? "" : String(message.content);
         switch (message.role) {
@@ -138,19 +304,13 @@ function convertMessagesToFalPrompt(messages) {
     // 清理末尾可能多余的空白，以便后续判断和拼接
     fixed_system_prompt_content = fixed_system_prompt_content.trim();
 
-
     // 3. 计算 system_prompt 中留给对话历史的剩余空间
-    // 注意：这里计算时要考虑分隔符可能占用的长度，但分隔符只在需要时添加
-    // 因此先计算不含分隔符的剩余空间
     let space_occupied_by_fixed_system = 0;
     if (fixed_system_prompt_content.length > 0) {
-        // 如果固定内容不为空，计算其长度 + 后面可能的分隔符的长度（如果需要）
-        // 暂时只计算内容长度，分隔符在组合时再考虑
-         space_occupied_by_fixed_system = fixed_system_prompt_content.length + 4; // 预留 \n\n...\n\n 的长度
+        space_occupied_by_fixed_system = fixed_system_prompt_content.length + 4;
     }
-     const remaining_system_limit = Math.max(0, SYSTEM_PROMPT_LIMIT - space_occupied_by_fixed_system);
+    const remaining_system_limit = Math.max(0, SYSTEM_PROMPT_LIMIT - space_occupied_by_fixed_system);
     console.log(`Trimmed fixed system prompt length: ${fixed_system_prompt_content.length}. Approx remaining system history limit: ${remaining_system_limit}`);
-
 
     // 4. 反向填充 User/Assistant 对话历史
     const prompt_history_blocks = [];
@@ -185,17 +345,17 @@ function convertMessagesToFalPrompt(messages) {
         // 如果 prompt 满了，尝试放入 system_prompt 的剩余空间
         if (!systemHistoryFull) {
             if (current_system_history_length + block_length <= remaining_system_limit) {
-                 system_prompt_history_blocks.unshift(message_block);
-                 current_system_history_length += block_length;
-                 continue;
+                system_prompt_history_blocks.unshift(message_block);
+                current_system_history_length += block_length;
+                continue;
             } else {
-                 systemHistoryFull = true;
-                 console.log(`System history limit (${remaining_system_limit}) reached.`);
+                systemHistoryFull = true;
+                console.log(`System history limit (${remaining_system_limit}) reached.`);
             }
         }
     }
 
-    // 5. *** 组合最终的 prompt 和 system_prompt (包含分隔符逻辑) ***
+    // 5. 组合最终的 prompt 和 system_prompt (包含分隔符逻辑)
     const system_prompt_history_content = system_prompt_history_blocks.join('').trim();
     const final_prompt = prompt_history_blocks.join('').trim();
 
@@ -204,7 +364,7 @@ function convertMessagesToFalPrompt(messages) {
 
     let final_system_prompt = "";
 
-    // 检查各部分是否有内容 (使用 trim 后的固定部分)
+    // 检查各部分是否有内容
     const hasFixedSystem = fixed_system_prompt_content.length > 0;
     const hasSystemHistory = system_prompt_history_content.length > 0;
 
@@ -221,12 +381,11 @@ function convertMessagesToFalPrompt(messages) {
         final_system_prompt = system_prompt_history_content;
         console.log("Using only history in system prompt slot.");
     }
-    // 如果两部分都为空，final_system_prompt 保持空字符串 ""
 
     // 6. 返回结果
     const result = {
-        system_prompt: final_system_prompt, // 最终结果不需要再 trim
-        prompt: final_prompt              // final_prompt 在组合前已 trim
+        system_prompt: final_system_prompt,
+        prompt: final_prompt
     };
 
     console.log(`Final system_prompt length (Sys+Separator+Hist): ${result.system_prompt.length}`);
@@ -234,17 +393,53 @@ function convertMessagesToFalPrompt(messages) {
 
     return result;
 }
-// === convertMessagesToFalPrompt 函数结束 ===
 
+// ======= 处理流式响应并收集完整输出的函数 =======
+async function collectStreamedResponse(falStream) {
+    let completeOutput = '';
+    let lastEventData = null;
+    let reasoningOutput = null;
 
-// POST /v1/chat/completions endpoint (添加了随机选择FAL_KEY的功能)
+    try {
+        for await (const event of falStream) {
+            // 保存最后一个事件的数据
+            lastEventData = event;
+            
+            // 如果存在output，累积到completeOutput
+            if (event && typeof event.output === 'string') {
+                completeOutput = event.output; // 直接使用完整输出，因为fal总是发送累积结果
+            }
+            
+            // 如果有reasoning字段，保存
+            if (event && event.reasoning) {
+                reasoningOutput = event.reasoning;
+            }
+            
+            // 检查是否完成 (partial=false表示完成)
+            if (event && event.partial === false) {
+                break;
+            }
+        }
+        
+        return {
+            output: completeOutput,
+            requestId: lastEventData?.request_id || `manual-${Date.now()}`,
+            reasoning: reasoningOutput
+        };
+    } catch (error) {
+        console.error('Error collecting streamed response:', error);
+        throw error;
+    }
+}
+
+// POST /v1/chat/completions endpoint (修改了处理逻辑，支持多模态)
 app.post('/v1/chat/completions', async (req, res) => {
     const { model, messages, stream = false, reasoning = false, ...restOpenAIParams } = req.body;
 
     console.log(`Received chat completion request for model: ${model}, stream: ${stream}`);
 
     if (!FAL_SUPPORTED_MODELS.includes(model)) {
-         console.warn(`Warning: Requested model '${model}' is not in the explicitly supported list.`);
+        console.warn(`Warning: Requested model '${model}' is not in the explicitly supported list.`);
     }
     if (!model || !messages || !Array.isArray(messages) || messages.length === 0) {
         console.error("Invalid request parameters:", { model, messages: Array.isArray(messages) ? messages.length : typeof messages });
@@ -252,7 +447,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     try {
-        // === 新增：随机选择一个FAL_KEY并配置 ===
+        // === 随机选择一个FAL_KEY并配置 ===
         const selectedKey = getRandomFalKey();
         // 重新配置fal客户端使用随机选择的密钥
         fal.config({
@@ -260,31 +455,59 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
         console.log(`Using randomly selected FAL key: ${selectedKey.substring(0, 5)}...`);
 
-        // *** 使用更新后的转换函数 ***
-        const { prompt, system_prompt } = convertMessagesToFalPrompt(messages);
+        // 检查是否使用多模态模型
+        const isMultiModal = supportsMultimodal(model);
+        console.log(`Model ${model} multimodal support: ${isMultiModal}`);
 
-        const falInput = {
-            model: model,
-            prompt: prompt,
-            ...(system_prompt && { system_prompt: system_prompt }),
-            reasoning: !!reasoning,
-        };
-        console.log("Fal Input:", JSON.stringify(falInput, null, 2));
-        console.log("Forwarding request to fal-ai with system-priority + separator + recency input:");
-        console.log("System Prompt Length:", system_prompt?.length || 0);
-        console.log("Prompt Length:", prompt?.length || 0);
-        // 调试时取消注释可以查看具体内容
-        console.log("--- System Prompt Start ---");
-        console.log(system_prompt);
-        console.log("--- System Prompt End ---");
-        console.log("--- Prompt Start ---");
-        console.log(prompt);
-        console.log("--- Prompt End ---");
+        // 使用更新后的转换函数，传入模型ID
+        const convertedInput = convertMessagesToFalPrompt(messages, model);
 
+        // 构建fal-ai请求参数
+        let falInput = {};
+        
+        if (convertedInput.is_claude_multimodal) {
+            // Claude多模态格式
+            falInput = {
+                model: model,
+                system: convertedInput.system_prompt || "",
+                messages: convertedInput.anthropic_messages,
+                reasoning: !!reasoning,
+            };
+            console.log("Using Claude multimodal format");
+        } else if (convertedInput.is_generic_multimodal) {
+            // 其他多模态模型格式
+            falInput = {
+                model: model,
+                system_prompt: convertedInput.system_prompt || "",
+                messages: convertedInput.generic_multimodal_messages,
+                reasoning: !!reasoning,
+            };
+            console.log("Using generic multimodal format");
+        } else {
+            // 使用原有的文本格式
+            falInput = {
+                model: model,
+                prompt: convertedInput.prompt,
+                ...(convertedInput.system_prompt && { system_prompt: convertedInput.system_prompt }),
+                reasoning: !!reasoning,
+            };
+            console.log("Using text-only format");
+        }
 
-        // --- 流式/非流式处理逻辑 (保持不变) ---
+        console.log("Fal Input Structure:", 
+            JSON.stringify({
+                model: falInput.model,
+                has_system: !!falInput.system || !!falInput.system_prompt,
+                has_messages: !!falInput.messages,
+                has_prompt: !!falInput.prompt,
+                is_multimodal: isMultiModal,
+                reasoning: falInput.reasoning
+            }, null, 2)
+        );
+
+        // --- 流式/非流式处理逻辑 ---
         if (stream) {
-            // ... 流式代码 ...
+            // === 流式处理逻辑（保持不变） ===
             res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
@@ -340,24 +563,52 @@ app.post('/v1/chat/completions', async (req, res) => {
                 }
             }
         } else {
-            // --- 非流式处理 (保持不变) ---
-            console.log("Executing non-stream request...");
-            const result = await fal.subscribe("fal-ai/any-llm", { input: falInput, logs: true });
-            console.log("Received non-stream result from fal-ai:", JSON.stringify(result, null, 2));
+            // === 非流式处理逻辑 ===
+            console.log("Executing non-stream request through stream API with collection...");
+            
+            try {
+                // 获取流式响应并收集完整输出
+                const falStream = await fal.stream("fal-ai/any-llm", { input: falInput });
+                const collectedResult = await collectStreamedResponse(falStream);
+                
+                console.log("Collected complete non-stream result:", JSON.stringify({
+                    output_length: collectedResult.output?.length,
+                    requestId: collectedResult.requestId,
+                    has_reasoning: !!collectedResult.reasoning
+                }));
 
-            if (result && result.error) {
-                 console.error("Fal-ai returned an error in non-stream mode:", result.error);
-                 return res.status(500).json({ object: "error", message: `Fal-ai error: ${JSON.stringify(result.error)}`, type: "fal_ai_error", param: null, code: null });
+                // 构造OpenAI格式的响应
+                const openAIResponse = {
+                    id: `chatcmpl-${collectedResult.requestId || Date.now()}`, 
+                    object: "chat.completion", 
+                    created: Math.floor(Date.now() / 1000), 
+                    model: model,
+                    choices: [{ 
+                        index: 0, 
+                        message: { 
+                            role: "assistant", 
+                            content: collectedResult.output || "" 
+                        }, 
+                        finish_reason: "stop" 
+                    }],
+                    usage: { prompt_tokens: null, completion_tokens: null, total_tokens: null }, 
+                    system_fingerprint: null,
+                    ...(collectedResult.reasoning && { fal_reasoning: collectedResult.reasoning }),
+                };
+                
+                res.json(openAIResponse);
+                console.log("Returned collected non-stream response.");
+            } catch (error) {
+                console.error('Error in non-stream mode using stream collection:', error);
+                const errorMessage = (error instanceof Error) ? error.message : JSON.stringify(error);
+                res.status(500).json({ 
+                    object: "error", 
+                    message: `Error collecting non-stream response: ${errorMessage}`, 
+                    type: "proxy_error", 
+                    param: null, 
+                    code: null 
+                });
             }
-
-            const openAIResponse = {
-                id: `chatcmpl-${result.requestId || Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: model,
-                choices: [{ index: 0, message: { role: "assistant", content: result.output || "" }, finish_reason: "stop" }],
-                usage: { prompt_tokens: null, completion_tokens: null, total_tokens: null }, system_fingerprint: null,
-                ...(result.reasoning && { fal_reasoning: result.reasoning }),
-            };
-            res.json(openAIResponse);
-            console.log("Returned non-stream response.");
         }
 
     } catch (error) {
@@ -372,7 +623,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 });
 
-// === 新增：添加CORS支持和OPTIONS请求处理 ===
+// === 添加CORS支持和OPTIONS请求处理 ===
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -384,20 +635,21 @@ app.use((req, res, next) => {
     next();
 });
 
-// 启动服务器 (更新启动信息)
+// 启动服务器
 app.listen(PORT, () => {
     console.log(`===================================================`);
-    console.log(` Fal OpenAI Proxy Server (System Top + Separator + Recency)`); 
+    console.log(` Fal OpenAI Proxy Server (多模态支持版本)`); 
     console.log(` Listening on port: ${PORT}`);
     console.log(` Using Limits: System Prompt=${SYSTEM_PROMPT_LIMIT}, Prompt=${PROMPT_LIMIT}`);
     console.log(` Fal AI Keys Loaded: ${FAL_KEYS.length}`);
     console.log(` Authentication Required: Yes (via Bearer Token)`);
     console.log(` Chat Completions Endpoint: POST http://localhost:${PORT}/v1/chat/completions`);
     console.log(` Models Endpoint: GET http://localhost:${PORT}/v1/models`);
+    console.log(` Multimodal Support: Enabled (${MULTIMODAL_MODELS.length} models)`);
     console.log(`===================================================`);
 });
 
-// 根路径响应 (更新信息)
+// 根路径响应
 app.get('/', (req, res) => {
-    res.send('Fal OpenAI Proxy (System Top + Separator + Recency Strategy) is running. Authentication required using Bearer token.');
+    res.send('Fal OpenAI Proxy (多模态支持版本) is running. Authentication required using Bearer token.');
 });
